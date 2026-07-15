@@ -1,0 +1,201 @@
+﻿
+sing System.Text;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Options;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+using Newtonsoft.Json;
+
+public class RabbitMQMessageConsumer : IMessageConsumer
+{
+    private readonly string _connectionString;
+    private readonly string _emailCartQueue;
+    private readonly string _registerUserQueue;
+
+    private readonly IConfiguration _configuration;
+    private readonly EmailService _emailService;
+
+    private IConnection? _connection;
+
+    // One channel per consumer (prefetch is per channel)
+    private IChannel? _emailCartChannel;
+    private IChannel? _registerUserChannel;
+
+    // Keep consumer tags for cancel on shutdown
+    private string? _emailCartConsumerTag;
+    private string? _registerUserConsumerTag;
+
+    public RabbitMQMessageConsumer(
+        IOptions<MessageQueueSettings> options,
+        IConfiguration configuration,
+        EmailService emailService)
+    {
+        _configuration = configuration;
+        _emailService = emailService;
+
+        _connectionString = options.Value.RabbitMQ.ConnectionString
+            ?? throw new InvalidOperationException("RabbitMQ connection string missing.");
+
+        _emailCartQueue = configuration["TopicAndQueueNames:EmailShoppingCartQueue"]
+            ?? throw new InvalidOperationException("EmailShoppingCartQueue config missing.");
+
+        _registerUserQueue = configuration["TopicAndQueueNames:RegisterUserQueue"]
+            ?? throw new InvalidOperationException("RegisterUserQueue config missing.");
+    }
+
+    public async Task StartAsync(CancellationToken ct)
+    {
+        // Create connection
+        var factory = new ConnectionFactory
+        {
+            Uri = new Uri(_connectionString),
+            // Optional: enable dispatch of async consumers (good practice even in v7)
+            DispatchConsumersAsync = true
+        };
+
+        _connection = await factory.CreateConnectionAsync(ct);
+
+        // Create separate channels
+        _emailCartChannel = await _connection.CreateChannelAsync(ct);
+        _registerUserChannel = await _connection.CreateChannelAsync(ct);
+
+        // QoS / Prefetch – tune per your workload
+        await _emailCartChannel.BasicQosAsync(0, prefetchCount: 10, global: false, cancellationToken: ct);
+        await _registerUserChannel.BasicQosAsync(0, prefetchCount: 10, global: false, cancellationToken: ct);
+
+        // Idempotent queue declarations – durable recommended for production
+        await _emailCartChannel.QueueDeclareAsync(
+            queue: _emailCartQueue, durable: true, exclusive: false, autoDelete: false, arguments: null, cancellationToken: ct);
+
+        await _registerUserChannel.QueueDeclareAsync(
+            queue: _registerUserQueue, durable: true, exclusive: false, autoDelete: false, arguments: null, cancellationToken: ct);
+
+        // Start consumers
+        _emailCartConsumerTag = await StartEmailCartConsumerAsync(ct);
+        _registerUserConsumerTag = await StartRegisterUserConsumerAsync(ct);
+    }
+
+    public async Task StopAsync(CancellationToken ct)
+    {
+        // Cancel consumers prior to closing channels
+        if (_emailCartChannel is not null && _emailCartConsumerTag is not null)
+        {
+            try { await _emailCartChannel.BasicCancelAsync(_emailCartConsumerTag, ct); } catch { /* ignore */ }
+        }
+        if (_registerUserChannel is not null && _registerUserConsumerTag is not null)
+        {
+            try { await _registerUserChannel.BasicCancelAsync(_registerUserConsumerTag, ct); } catch { /* ignore */ }
+        }
+
+        // Close / dispose channels
+        if (_emailCartChannel is not null)
+        {
+            try { await _emailCartChannel.CloseAsync(ct); } catch { /* ignore */ }
+            await _emailCartChannel.DisposeAsync();
+            _emailCartChannel = null;
+        }
+
+        if (_registerUserChannel is not null)
+        {
+            try { await _registerUserChannel.CloseAsync(ct); } catch { /* ignore */ }
+            await _registerUserChannel.DisposeAsync();
+            _registerUserChannel = null;
+        }
+
+        // Close / dispose connection
+        if (_connection is not null)
+        {
+            try { await _connection.CloseAsync(ct); } catch { /* ignore */ }
+            _connection.Dispose();
+            _connection = null;
+        }
+    }
+
+    private async Task<string> StartEmailCartConsumerAsync(CancellationToken ct)
+    {
+        var channel = _emailCartChannel ?? throw new InvalidOperationException("EmailCart channel not initialized.");
+
+        var consumer = new AsyncEventingBasicConsumer(channel);
+
+        // v7 often provides (sender, ea, ct) signature; the following works with or without ct in the event
+        consumer.ReceivedAsync += async (sender, ea, handlerCt) =>
+        {
+            var body = ea.Body.ToArray();
+            var json = Encoding.UTF8.GetString(body);
+
+            try
+            {
+                var cart = JsonConvert.DeserializeObject<CartDto>(json)
+                           ?? throw new InvalidOperationException("Deserialized CartDto is null.");
+
+                // Do your async work
+                await _emailService.EmailCartAndLog(cart);
+
+                await channel.BasicAckAsync(ea.DeliveryTag, multiple: false, cancellationToken: handlerCt);
+            }
+            catch (Exception)
+            {
+                // Prefer DLQ (nack requeue: false) to avoid poison-message loops
+                await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: false, cancellationToken: handlerCt);
+            }
+        };
+
+        // Start consuming (manual ack)
+        return await channel.BasicConsumeAsync(
+            queue: _emailCartQueue,
+            autoAck: false,
+            consumer: consumer,
+            cancellationToken: ct);
+    }
+
+    private async Task<string> StartRegisterUserConsumerAsync(CancellationToken ct)
+    {
+        var channel = _registerUserChannel ?? throw new InvalidOperationException("RegisterUser channel not initialized.");
+
+        var consumer = new AsyncEventingBasicConsumer(channel);
+
+        consumer.ReceivedAsync += async (sender, ea, handlerCt) =>
+        {
+            var body = ea.Body.ToArray();
+            var json = Encoding.UTF8.GetString(body);
+
+            try
+            {
+                var user = JsonConvert.DeserializeObject<UserDto>(json)
+                           ?? throw new InvalidOperationException("Deserialized UserDto is null.");
+
+                await _emailService.RegisterUserEmailAndLog(user);
+
+                await channel.BasicAckAsync(ea.DeliveryTag, multiple: false, cancellationToken: handlerCt);
+            }
+            catch (Exception)
+            {
+                await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: false, cancellationToken: handlerCt);
+            }
+        };
+
+        return await channel.BasicConsumeAsync(
+            queue: _registerUserQueue,
+            autoAck: false,
+            consumer: consumer,
+            cancellationToken: ct);
+    }
+}
+
+//To integrate with the host, add a tiny wrapper hosted service:
+
+public class RabbitMqConsumerHostedService : BackgroundService
+{
+    private readonly IMessageConsumer _consumer;
+    public RabbitMqConsumerHostedService(IMessageConsumer consumer) => _consumer = consumer;
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        await _consumer.StartAsync(stoppingToken);
+        try { await Task.Delay(Timeout.Infinite, stoppingToken); }
+        catch (OperationCanceledException) { }
+    }
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        await _consumer.StopAsync(cancellationToken);
+    }
+}
