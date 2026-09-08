@@ -1,0 +1,83 @@
+name: EmailAPI CI/CD
+
+on:
+  push:
+    branches:
+      - feature/nesan-mango-emailAPI-nuget-reference
+
+  pull_request:
+    branches:
+      - feature/nesan-mango-EmailAPI
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout repository
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      # 2. Install .NET
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      # 3. Configure GitHub Packages
+      #    Required because EmailAPI depends on Mango.MessageBus
+      - name: Configure GitHub Packages
+        run: |
+          dotnet nuget add source \
+            --username ${{ github.actor }} \
+            --password ${{ secrets.GITHUB_TOKEN }} \
+            --store-password-in-clear-text \
+            --name github \
+            "https://nuget.pkg.github.com/MdKasimS-CCG/index.json"
+
+      # 4. Restore NuGet dependencies
+      - name: Restore dependencies
+        run: dotnet restore Mango.Services.EmailAPI.csproj
+
+      # 5. Build application
+      - name: Build
+        run: |
+          dotnet build Mango.Services.EmailAPI.csproj \
+            --configuration Release \
+            --no-restore
+
+      # 6. No automated tests currently exist
+      - name: Test
+        run: |
+          echo "No test project exists for Mango.Services.EmailAPI."
+          echo "Skipping automated tests."
+
+      # 7. Build Docker image only for Pull Requests
+      - name: Build Docker image
+        if: github.event_name == 'pull_request'
+        run: |
+          docker build \
+            --file Dockerfile \
+            --tag ghcr.io/mdkasims-ccg/mango-services-emailapi:pr-${{ github.event.pull_request.number }} \
+            .
+
+      # 8. Login to GitHub Container Registry
+      - name: Login to GHCR
+        if: github.event_name == 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 9. Push Docker image to GHCR
+      - name: Push Docker image
+        if: github.event_name == 'pull_request'
+        run: |
+          docker push \
+            ghcr.io/mdkasims-ccg/mango-services-emailapi:pr-${{ github.event.pull_request.number }}
