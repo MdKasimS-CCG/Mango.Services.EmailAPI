@@ -11,14 +11,11 @@ EXPOSE 8081
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 ARG BUILD_CONFIGURATION=Release
 WORKDIR /src
-COPY ["Mango.Services.EmailAPI.csproj", "Mango.Services.EmailAPI/"]
+COPY ["Mango.Services.EmailAPI.csproj", "./"]
 RUN --mount=type=secret,id=nugetconfig \
-    dotnet restore "./Mango.Services.EmailAPI/Mango.Services.EmailAPI.csproj" \
+    dotnet restore "./Mango.Services.EmailAPI.csproj" \
     --configfile /run/secrets/nugetconfig
 COPY . .
-WORKDIR "/src/Mango.Services.EmailAPI"
-RUN echo "=== Files in EmailAPI ===" && \
-    find /src/Mango.Services.EmailAPI -maxdepth 2 -type f | sort
 RUN dotnet build "./Mango.Services.EmailAPI.csproj" -c $BUILD_CONFIGURATION -o /app/build
 
 # This stage is used to publish the service project to be copied to the final stage
