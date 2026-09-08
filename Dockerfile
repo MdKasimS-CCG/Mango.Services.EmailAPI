@@ -12,7 +12,7 @@ EXPOSE 8081
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 ARG BUILD_CONFIGURATION=Release
 WORKDIR /src
-COPY ["Mango.Services.EmailAPI/Mango.Services.EmailAPI.csproj", "Mango.Services.EmailAPI/"]
+COPY ["Mango.Services.EmailAPI.csproj", "Mango.Services.EmailAPI/"]
 RUN dotnet restore "./Mango.Services.EmailAPI/Mango.Services.EmailAPI.csproj"
 COPY . .
 WORKDIR "/src/Mango.Services.EmailAPI"
