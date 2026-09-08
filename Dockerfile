@@ -1,5 +1,5 @@
-# See https://aka.ms/customizecontainer to learn how to customize your debug container and how Visual Studio uses this Dockerfile to build your images for faster debugging.
-
+# https://aka.ms/customizecontainer to learn how to customize your debug container and how Visual Studio uses this Dockerfile to build your images for faster debugging.
+# syntax=docker/dockerfile:1
 # This stage is used when running from VS in fast mode (Default for Debug configuration)
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS base
 USER $APP_UID
@@ -7,16 +7,15 @@ WORKDIR /app
 EXPOSE 8080
 EXPOSE 8081
 
-
 # This stage is used to build the service project
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 ARG BUILD_CONFIGURATION=Release
 WORKDIR /src
-COPY ["Backend/Mango.Services.EmailAPI/Mango.Services.EmailAPI.csproj", "Backend/Mango.Services.EmailAPI/"]
-COPY ["Integration/Mango.MessageBus/Mango.MessageBus.csproj", "Integration/Mango.MessageBus/"]
-RUN dotnet restore "./Backend/Mango.Services.EmailAPI/Mango.Services.EmailAPI.csproj"
+COPY ["Mango.Services.EmailAPI.csproj", "./"]
+RUN --mount=type=secret,id=nugetconfig \
+    dotnet restore "./Mango.Services.EmailAPI.csproj" \
+    --configfile /run/secrets/nugetconfig
 COPY . .
-WORKDIR "/src/Backend/Mango.Services.EmailAPI"
 RUN dotnet build "./Mango.Services.EmailAPI.csproj" -c $BUILD_CONFIGURATION -o /app/build
 
 # This stage is used to publish the service project to be copied to the final stage
