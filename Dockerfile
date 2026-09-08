@@ -17,6 +17,8 @@ RUN --mount=type=secret,id=nugetconfig \
     --configfile /run/secrets/nugetconfig
 COPY . .
 WORKDIR "/src/Mango.Services.EmailAPI"
+RUN echo "=== Files in EmailAPI ===" && \
+    find /src/Mango.Services.EmailAPI -maxdepth 2 -type f | sort
 RUN dotnet build "./Mango.Services.EmailAPI.csproj" -c $BUILD_CONFIGURATION -o /app/build
 
 # This stage is used to publish the service project to be copied to the final stage
