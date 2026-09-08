@@ -43,6 +43,14 @@ jobs:
       - name: Restore dependencies
         run: dotnet restore Mango.Services.EmailAPI.csproj
 
+      - name: Check repository files
+        run: |
+          echo "=== Repository root ==="
+          ls -la
+      
+          echo "=== C# files ==="
+          find . -name "*.cs" -type f | sort
+
       # 5. Build application
       - name: Build
         run: |
