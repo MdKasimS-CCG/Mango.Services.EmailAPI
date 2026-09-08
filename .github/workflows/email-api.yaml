@@ -29,18 +29,26 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      # 3. Create temporary NuGet configuration
+      # 3. Create isolated NuGet configuration
       - name: Create NuGet config
         run: |
-          dotnet new nugetconfig --output "$RUNNER_TEMP"
+          cat > "$RUNNER_TEMP/NuGet.Config" <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+              <add key="github" value="https://nuget.pkg.github.com/MdKasimS-CCG/index.json" />
+            </packageSources>
 
-          dotnet nuget add source \
-            --username "${{ github.actor }}" \
-            --password "${{ secrets.GITHUB_TOKEN }}" \
-            --store-password-in-clear-text \
-            --name github \
-            --configfile "$RUNNER_TEMP/NuGet.Config" \
-            "https://nuget.pkg.github.com/MdKasimS-CCG/index.json"
+            <packageSourceCredentials>
+              <github>
+                <add key="Username" value="${{ github.actor }}" />
+                <add key="ClearTextPassword" value="${{ secrets.GITHUB_TOKEN }}" />
+              </github>
+            </packageSourceCredentials>
+          </configuration>
+          EOF
 
       # 4. Restore NuGet dependencies
       - name: Restore dependencies
