@@ -3,7 +3,7 @@ name: EmailAPI CI/CD
 on:
   push:
     branches:
-      - feature/nesan-mango-emailAPI-*
+      - 'feature/*'
 
   pull_request:
     branches:
