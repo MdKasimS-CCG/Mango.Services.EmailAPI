@@ -4,10 +4,15 @@ on:
   push:
     branches:
       - 'feature/*'
+      - main
 
   pull_request:
     branches:
       - main
+    types: 
+      - opened
+      - synchronize
+      - reopened
 
 permissions:
   contents: read
@@ -18,17 +23,26 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout repository
+      # Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      # 2. Install .NET
+      # Install .NET
       - name: Setup .NET
         uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '10.0.x'
+          
+      # Cache NuGet packages
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-mango-emailapi-${{ hashFiles('Mango.Services.EmailAPI.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-mango-emailapi-
 
-      # 3. Create isolated NuGet configuration
+      # Create isolated NuGet configuration
       - name: Configure GitHub Packages
         run: |
           dotnet nuget add source \
@@ -38,45 +52,51 @@ jobs:
             --name mango-github \
             "https://nuget.pkg.github.com/MdKasimS-CCG/index.json"
 
-      # 4. Restore NuGet dependencies
+      # Restore NuGet dependencies
       - name: Restore dependencies
         run: dotnet restore Mango.Services.EmailAPI.csproj
 
-      # 5. Build application
+      # Build application
       - name: Build
         run: |
           dotnet build Mango.Services.EmailAPI.csproj \
             --configuration Release \
             --no-restore
 
-      # 6. No automated tests currently exist
+      # No automated tests currently exist
       - name: Test
         run: |
           echo "No test project exists for Mango.Services.EmailAPI."
           echo "Skipping automated tests."
 
-      # 7. Build Docker image
+      # Set up Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        
+      # Build Docker image
       - name: Build Docker image
-        if: github.event_name == 'pull_request'
         run: |
-          docker build \
+          docker buildx build \
             --secret id=nugetconfig,src="$HOME/.nuget/NuGet/NuGet.Config" \
             --file Dockerfile \
-            --tag ghcr.io/mdkasims-ccg/mango-services-emailapi:pr-${{ github.event.pull_request.number }} \
+            --tag ghcr.io/mdkasims-ccg/mango-services-emailapi:${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }} \
+            --load \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
             .
 
-      # 8. Login to GitHub Container Registry
+      # Login to GitHub Container Registry
       - name: Login to GHCR
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 9. Push Docker image to GHCR
+      # Push Docker image to GHCR
       - name: Push Docker image
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           docker push \
-            ghcr.io/mdkasims-ccg/mango-services-emailapi:pr-${{ github.event.pull_request.number }}
+            ghcr.io/mdkasims-ccg/mango-services-emailapi:${{ github.sha }}
