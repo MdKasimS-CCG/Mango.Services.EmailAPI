@@ -4,6 +4,7 @@ using Mango.Services.EmailAPI.Extension;
 using Mango.Services.EmailAPI.Messaging;
 using Mango.Services.EmailAPI.Services;
 
+//TODO: Check induvidual container comms with MSSQL and RabbitMQ.
 using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
