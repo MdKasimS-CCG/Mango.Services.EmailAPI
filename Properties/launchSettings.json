@@ -34,13 +34,12 @@
       "launchUrl": "{Scheme}://{ServiceHost}:{ServicePort}/swagger",
       "environmentVariables": {
         "ASPNETCORE_HTTP_PORTS": "8080",
-        "ASPNETCORE_ENVIRONMENT": "Development",
-        "ConnectionStrings__DefaultConnection": "Server=host.docker.internal,1433;Database=Mango_Email;User Id=sa;Password=Admin@786_123;TrustServerCertificate=true;Encrypt=False",
-        "MessageQueue__RabbitMQ__ConnectionString": "amqp://guest:guest@host.docker.internal:5672"
+        "ASPNETCORE_ENVIRONMENT": "Development"
       },
       "publishAllPorts": false,
       "useSSL": false,
-      "httpPort": 5126
+      "httpPort": 5126,
+      "containerRunEnvironmentFiles": "D:\\Git\\MangoApplication\\Backend\\Mango.Services.EmailAPI\\.env"
     }
   },
   "$schema": "http://json.schemastore.org/launchsettings.json",
