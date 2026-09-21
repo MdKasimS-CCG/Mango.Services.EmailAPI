@@ -4,9 +4,9 @@ using Mango.Services.EmailAPI.Extension;
 using Mango.Services.EmailAPI.Messaging;
 using Mango.Services.EmailAPI.Services;
 
-//TODO: Check induvidual container comms with MSSQL and RabbitMQ.
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
+using DotNetEnv;
 
 // Determine whether the application is running inside a Docker container.
 bool isRunningInContainer =
@@ -15,7 +15,7 @@ bool isRunningInContainer =
 // manually before creating the WebApplicationBuilder.
 if (!isRunningInContainer)
 {
-    LoadEnvFile(".env");
+    Env.Load();
 }
 
 var builder = WebApplication.CreateBuilder(args);
@@ -166,86 +166,6 @@ void ApplyMigration()
         }
     }
 }
-
-void LoadEnvFile(string fileName)
-{
-    var envPath = Path.Combine(
-        Directory.GetParent(AppContext.BaseDirectory)!
-            .Parent!
-            .Parent!
-            .Parent!
-            .FullName,
-        fileName);
-
-    if (!File.Exists(envPath))
-    {
-        throw new FileNotFoundException(
-            $"The environment file '{fileName}' was not found.",
-            envPath);
-    }
-
-    foreach (var line in File.ReadAllLines(envPath))
-    {
-        var trimmedLine = line.Trim();
-
-
-        // Ignore blank lines and comments.
-        if (string.IsNullOrWhiteSpace(trimmedLine) ||
-            trimmedLine.StartsWith("#"))
-        {
-            continue;
-        }
-
-
-        // Support optional "export KEY=value".
-        if (trimmedLine.StartsWith("export "))
-        {
-            trimmedLine =
-                trimmedLine["export ".Length..].Trim();
-        }
-
-
-        // Find the first '='.
-        //
-        // This is important because connection strings can
-        // themselves contain '=' characters.
-        var separatorIndex =
-            trimmedLine.IndexOf('=');
-
-        if (separatorIndex <= 0)
-        {
-            continue;
-        }
-
-
-        // Extract key.
-        var key =
-            trimmedLine[..separatorIndex].Trim();
-
-
-        // Extract value.
-        var value =
-            trimmedLine[(separatorIndex + 1)..].Trim();
-
-
-        // Remove surrounding quotes if present.
-        if (value.Length >= 2 &&
-            ((value.StartsWith('"') &&
-              value.EndsWith('"')) ||
-             (value.StartsWith('\'') &&
-              value.EndsWith('\''))))
-        {
-            value = value[1..^1];
-        }
-
-
-        // Add the value to the process environment.
-        Environment.SetEnvironmentVariable(
-            key,
-            value);
-    }
-}
-
 
 public class EmailOptions
 {
