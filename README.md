@@ -11,7 +11,7 @@ EmailAPI is a background message-consuming microservice in the Mango application
 - [Prerequisites](#prerequisites)
 - [Run locally](#run-locally)
 - [Run with Docker](#run-with-docker)
-- [Run with Docker using any terminal] (#run-via-any-terminal)
+- [Docker Setup Commands - Can Be Used Via Any Terminal](#docker-setup-commands---can-be-used-via-any-terminal)
 - [Run in the full Mango Compose stack](#run-in-the-full-mango-compose-stack)
 - [CI/CD](#cicd)
 - [Persistence and observability](#persistence-and-observability)
