@@ -79,8 +79,11 @@ namespace Mango.Services.EmailAPI.Messaging
 
                 try
                 {
+                    Console.WriteLine("[EmailAPI] Received cart-email message.");
                     await _emailService.EmailCartAndLog(objMessage);
+                    Console.WriteLine("[EmailAPI] Cart-email message processed successfully.");
                     await _channel.BasicAckAsync(args.DeliveryTag, false);
+                    Console.WriteLine("[EmailAPI] Cart-email message acknowledged.");
                 }
                 catch
                 {
@@ -115,6 +118,7 @@ namespace Mango.Services.EmailAPI.Messaging
             return Task.CompletedTask;
         }
 
+
         private async Task StartRegisterUserConsumerAsync()
         {
             var consumer = new AsyncEventingBasicConsumer(_channel);
@@ -124,17 +128,39 @@ namespace Mango.Services.EmailAPI.Messaging
                 var body = args.Body.ToArray();
                 var message = Encoding.UTF8.GetString(body);
 
-                UserDto user =
-                    JsonConvert.DeserializeObject<UserDto>(message);
-
                 try
                 {
+                    var user = JsonConvert.DeserializeObject<UserDto>(message);
+
+                    if (user == null)
+                    {
+                        throw new InvalidOperationException(
+                            "Registration message could not be deserialized.");
+                    }
+
+                    Console.WriteLine(
+                        $"[EmailAPI] Received registration message. " +
+                        $"DeliveryTag: {args.DeliveryTag}");
+
                     await _emailService.RegisterUserEmailAndLog(user);
+
+                    Console.WriteLine(
+                        "[EmailAPI] Registration message processed successfully.");
+
                     await _channel.BasicAckAsync(args.DeliveryTag, false);
+
+                    Console.WriteLine(
+                        "[EmailAPI] Registration message acknowledged.");
                 }
-                catch
+                catch (Exception ex)
                 {
-                    await _channel.BasicNackAsync(args.DeliveryTag, false, true);
+                    Console.WriteLine(
+                        $"[EmailAPI] Registration message processing failed: {ex}");
+
+                    await _channel.BasicNackAsync(
+                        args.DeliveryTag,
+                        multiple: false,
+                        requeue: true);
                 }
             };
 
@@ -142,7 +168,11 @@ namespace Mango.Services.EmailAPI.Messaging
                 queue: _registerUserQueue,
                 autoAck: false,
                 consumer: consumer);
+
+            Console.WriteLine(
+                $"[EmailAPI] Listening for registration messages on '{_registerUserQueue}'.");
         }
+
 
         //private async Task StartOrderPlacedConsumerAsync()
         //{
