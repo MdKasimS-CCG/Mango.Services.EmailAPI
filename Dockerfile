@@ -12,9 +12,6 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 ARG BUILD_CONFIGURATION=Release
 WORKDIR /src
 COPY ["Mango.Services.EmailAPI.csproj", "./"]
-RUN --mount=type=secret,id=nugetconfig \
-    dotnet restore "./Mango.Services.EmailAPI.csproj" \
-    --configfile /run/secrets/nugetconfig
 COPY . .
 RUN dotnet build "./Mango.Services.EmailAPI.csproj" -c $BUILD_CONFIGURATION -o /app/build
 
