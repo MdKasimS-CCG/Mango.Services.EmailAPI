@@ -96,6 +96,9 @@ namespace Mango.Services.EmailAPI.Messaging
                 queue: _emailCartQueue,
                 autoAck: false,
                 consumer: consumer);
+
+            Console.WriteLine(
+                $"[EmailAPI] Listening for cart-email messages on '{_emailCartQueue}'.");
         }
 
         public async Task Start()
