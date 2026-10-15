@@ -1,4 +1,4 @@
-//using Mango.MessageBus;
+using Mango.MessageBus;
 using Mango.Services.EmailAPI.Data;
 using Mango.Services.EmailAPI.Extension;
 using Mango.Services.EmailAPI.Messaging;

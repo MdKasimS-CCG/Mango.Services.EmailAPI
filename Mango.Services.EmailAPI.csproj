@@ -14,7 +14,7 @@
 	  <PackageReference Include="AutoMapper" Version="15.1.1" />
 	  <PackageReference Include="AutoMapper.Extensions.Microsoft.DependencyInjection" Version="12.0.0" />
 	  <PackageReference Include="DotNetEnv" Version="3.2.0" />
-	  <PackageReference Include="Mango.MessageBus" Version="1.0.0" />
+	  <PackageReference Include="Mango.MessageBus" Version="2.0.0" />
 	  <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="8.0.19" />
 	  <PackageReference Include="Microsoft.EntityFrameworkCore" Version="9.0.8" />
 	  <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="9.0.8" />
