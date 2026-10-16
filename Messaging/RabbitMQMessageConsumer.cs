@@ -1,139 +1,196 @@
 ﻿using Mango.Services.EmailAPI.Models.Dto;
 using Mango.Services.EmailAPI.Services;
-
-using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
-
 using Newtonsoft.Json;
-
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
-
-using System.Data.Common;
 using System.Text;
-using System.Threading.Channels;
 
 namespace Mango.Services.EmailAPI.Messaging
 {
-    //TODO: Make it as worker service - Inherit BackgroundService.
-    //Note: Whenever EmailAPI spins up, Consumers are also spinning. If they couldn't, application is crashing in VS2026 Debug mode at least.
-    public class RabbitMQMessageConsumer: IMessageConsumer
+    public sealed class RabbitMQMessageConsumer : IHostedService
     {
-        private readonly string _messageBusConnectionString;
+        private readonly string _connectionString;
         private readonly string _emailCartQueue;
         private readonly string _registerUserQueue;
-        private readonly IConfiguration _configuration;
-
-        //TODO: Because it is singleton, we don't need interface
+        private readonly string _orderCreatedEmailQueue;
         private readonly EmailService _emailService;
-        private IConnection _connection;
-        private IChannel _channel;
 
-        public RabbitMQMessageConsumer(IOptions<MessageQueueSettings> options
-                                        , IConfiguration configuration
-                                        , EmailService emailService)
+        private IConnection? _connection;
+        private IChannel? _cartChannel;
+        private IChannel? _registrationChannel;
+        private IChannel? _orderCreatedChannel;
+
+        private string? _cartConsumerTag;
+        private string? _registrationConsumerTag;
+        private string? _orderCreatedConsumerTag;
+
+        public RabbitMQMessageConsumer(
+            IOptions<MessageQueueSettings> options,
+            IConfiguration configuration,
+            EmailService emailService)
         {
-            _configuration = configuration ?? throw new InvalidOperationException("RabbitMQ connection string missing.");
+            ArgumentNullException.ThrowIfNull(options);
+            ArgumentNullException.ThrowIfNull(configuration);
+            ArgumentNullException.ThrowIfNull(emailService);
+
             _emailService = emailService;
-            _messageBusConnectionString = options.Value.RabbitMQ.ConnectionString;
 
-            /* TODO: Here GetValue was not working somehow
-             * _emailCartQueue = _configuration.GetValue<string>("Key");
-             */
-            _emailCartQueue = configuration["TopicAndQueueNames:EmailShoppingCartQueue"] ?? throw new InvalidOperationException("EmailShoppingCartQueue config missing."); ;
+            _connectionString =
+                options.Value.RabbitMQ?.ConnectionString
+                ?? throw new InvalidOperationException(
+                    "RabbitMQ connection string is missing.");
 
-            _registerUserQueue = configuration["TopicAndQueueNames:RegisterUserQueue"] ?? throw new InvalidOperationException("RegisterUserQueue config missing."); ;
+            _emailCartQueue = GetQueueName(
+                configuration, "EmailShoppingCartQueue");
 
-            //_orderCreatedQueue =
-            //    configuration["TopicAndQueueNames:OrderCreatedTopic"]?? throw new InvalidOperationException("OrderCreatedQueue config missing.");;
+            _registerUserQueue = GetQueueName(
+                configuration, "RegisterUserQueue");
 
-            // TODO: Refactor it. Not satisfied with this arrangements. The reason is - if async is available,
-            // with this setting it remains unused.
-            var factory = new ConnectionFactory()
-            {
-                Uri = new Uri(_messageBusConnectionString)
-            };
-
-            //TODO: sync-over-async and can deadlock (and it hides failures during DI construction)
-            //TODO: Per queue, you can create channel instead of single one. Scaling factor
-            //TODO: When RabbitMQ is not running, it throws exception. Handle this exception. If its not reachable, whole application is crashing. Microservice arch?
-            _connection = factory.CreateConnectionAsync().Result;
-            _channel = _connection.CreateChannelAsync().Result;
-
-            _channel.QueueDeclareAsync(_emailCartQueue, false, false, false, null);
-            _channel.QueueDeclareAsync(_registerUserQueue, false, false, false, null);
-            //_channel.QueueDeclareAsync(_orderCreatedQueue, false, false, false, null);
+            _orderCreatedEmailQueue = GetQueueName(
+                configuration, "OrderCreatedEmailQueue");
         }
 
-        private async Task StartEmailCartConsumerAsync()
+        private static string GetQueueName(
+            IConfiguration configuration, string key)
         {
-            var consumer = new AsyncEventingBasicConsumer(_channel);
+            return configuration[$"TopicAndQueueNames:{key}"]
+                ?? throw new InvalidOperationException(
+                    $"Queue configuration '{key}' is missing.");
+        }
 
-            consumer.ReceivedAsync += async (sender, args) =>
+        public async Task StartAsync(CancellationToken cancellationToken)
+        {
+            var factory = new ConnectionFactory
             {
-                var body = args.Body.ToArray();
-                var message = Encoding.UTF8.GetString(body);
+                Uri = new Uri(_connectionString)
+            };
 
-                var objMessage =
-                    JsonConvert.DeserializeObject<CartDto>(message);
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
 
+                _connection = await factory.CreateConnectionAsync();
+
+                // Each consumer owns its own channel.
+                _cartChannel = await CreateConsumerChannelAsync(
+                    _emailCartQueue);
+
+                _registrationChannel = await CreateConsumerChannelAsync(
+                    _registerUserQueue);
+
+                _orderCreatedChannel = await CreateConsumerChannelAsync(
+                    _orderCreatedEmailQueue);
+
+                _cartConsumerTag = await StartCartConsumerAsync(
+                    _cartChannel);
+
+                _registrationConsumerTag =
+                    await StartRegistrationConsumerAsync(
+                        _registrationChannel);
+
+                _orderCreatedConsumerTag =
+                    await StartOrderCreatedConsumerAsync(
+                        _orderCreatedChannel);
+
+                Console.WriteLine(
+                    "[EmailAPI] All RabbitMQ consumers started.");
+            }
+            catch
+            {
+                await DisposeRabbitMQResourcesAsync();
+                throw;
+            }
+        }
+
+        private async Task<IChannel> CreateConsumerChannelAsync(
+            string queueName)
+        {
+            var channel = await _connection!.CreateChannelAsync();
+
+            try
+            {
+                await channel.QueueDeclareAsync(
+                    queue: queueName,
+                    durable: false,
+                    exclusive: false,
+                    autoDelete: false,
+                    arguments: null);
+
+                return channel;
+            }
+            catch
+            {
+                await channel.DisposeAsync();
+                throw;
+            }
+        }
+
+        private async Task<string> StartCartConsumerAsync(
+            IChannel channel)
+        {
+            var consumer = new AsyncEventingBasicConsumer(channel);
+
+            consumer.ReceivedAsync += async (_, args) =>
+            {
                 try
                 {
-                    Console.WriteLine("[EmailAPI] Received cart-email message.");
-                    await _emailService.EmailCartAndLog(objMessage);
-                    Console.WriteLine("[EmailAPI] Cart-email message processed successfully.");
-                    await _channel.BasicAckAsync(args.DeliveryTag, false);
-                    Console.WriteLine("[EmailAPI] Cart-email message acknowledged.");
+                    var message = Encoding.UTF8.GetString(
+                        args.Body.ToArray());
+
+                    var cart = JsonConvert.DeserializeObject<CartDto>(
+                        message);
+
+                    if (cart == null)
+                    {
+                        throw new InvalidOperationException(
+                            "Cart message could not be deserialized.");
+                    }
+
+                    await _emailService.EmailCartAndLog(cart);
+
+                    await channel.BasicAckAsync(
+                        args.DeliveryTag, false);
+
+                    Console.WriteLine(
+                        "[EmailAPI] Cart-email message processed and acknowledged.");
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // optionally requeue
-                    await _channel.BasicNackAsync(args.DeliveryTag, false, true);
+                    Console.WriteLine(
+                        $"[EmailAPI] Cart-email processing failed: {ex}");
+
+                    await channel.BasicNackAsync(
+                        args.DeliveryTag, false, true);
                 }
             };
 
-            await _channel.BasicConsumeAsync(
+            var tag = await channel.BasicConsumeAsync(
                 queue: _emailCartQueue,
                 autoAck: false,
                 consumer: consumer);
 
             Console.WriteLine(
                 $"[EmailAPI] Listening for cart-email messages on '{_emailCartQueue}'.");
+
+            return tag;
         }
 
-        public async Task Start()
+        private async Task<string> StartRegistrationConsumerAsync(
+            IChannel channel)
         {
-            await StartEmailCartConsumerAsync();
-            await StartRegisterUserConsumerAsync();
-            //await StartOrderPlacedConsumerAsync();
-        }
+            var consumer = new AsyncEventingBasicConsumer(channel);
 
-        public async Task Stop()
-        {
-            await _channel.DisposeAsync();
-            await _connection.DisposeAsync();
-        }
-
-        //Pass error handler from RabbitMQ documentation
-        private Task ErrorHandler()
-        {
-            Console.WriteLine("");
-            return Task.CompletedTask;
-        }
-
-
-        private async Task StartRegisterUserConsumerAsync()
-        {
-            var consumer = new AsyncEventingBasicConsumer(_channel);
-
-            consumer.ReceivedAsync += async (sender, args) =>
+            consumer.ReceivedAsync += async (_, args) =>
             {
-                var body = args.Body.ToArray();
-                var message = Encoding.UTF8.GetString(body);
-
                 try
                 {
-                    var user = JsonConvert.DeserializeObject<UserDto>(message);
+                    var message = Encoding.UTF8.GetString(
+                        args.Body.ToArray());
+
+                    var user = JsonConvert.DeserializeObject<UserDto>(
+                        message);
 
                     if (user == null)
                     {
@@ -141,69 +198,153 @@ namespace Mango.Services.EmailAPI.Messaging
                             "Registration message could not be deserialized.");
                     }
 
-                    Console.WriteLine(
-                        $"[EmailAPI] Received registration message. " +
-                        $"DeliveryTag: {args.DeliveryTag}");
-
                     await _emailService.RegisterUserEmailAndLog(user);
 
-                    Console.WriteLine(
-                        "[EmailAPI] Registration message processed successfully.");
-
-                    await _channel.BasicAckAsync(args.DeliveryTag, false);
+                    await channel.BasicAckAsync(
+                        args.DeliveryTag, false);
 
                     Console.WriteLine(
-                        "[EmailAPI] Registration message acknowledged.");
+                        "[EmailAPI] Registration message processed and acknowledged.");
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine(
-                        $"[EmailAPI] Registration message processing failed: {ex}");
+                        $"[EmailAPI] Registration processing failed: {ex}");
 
-                    await _channel.BasicNackAsync(
-                        args.DeliveryTag,
-                        multiple: false,
-                        requeue: true);
+                    await channel.BasicNackAsync(
+                        args.DeliveryTag, false, true);
                 }
             };
 
-            await _channel.BasicConsumeAsync(
+            var tag = await channel.BasicConsumeAsync(
                 queue: _registerUserQueue,
                 autoAck: false,
                 consumer: consumer);
 
             Console.WriteLine(
                 $"[EmailAPI] Listening for registration messages on '{_registerUserQueue}'.");
+
+            return tag;
         }
 
+        private async Task<string> StartOrderCreatedConsumerAsync(
+            IChannel channel)
+        {
+            var consumer = new AsyncEventingBasicConsumer(channel);
 
-        //private async Task StartOrderPlacedConsumerAsync()
-        //{
-        //    var consumer = new EventingBasicConsumer(_channel);
+            consumer.ReceivedAsync += async (_, args) =>
+            {
+                try
+                {
+                    var message = Encoding.UTF8.GetString(
+                        args.Body.ToArray());
 
-        //    consumer.Received += async (sender, args) =>
-        //    {
-        //        var body = args.Body.ToArray();
-        //        var message = Encoding.UTF8.GetString(body);
+                    var orderEvent =
+                        JsonConvert.DeserializeObject<OrderCreatedEventDto>(
+                            message);
 
-        //        RewardsMessage objMessage =
-        //            JsonConvert.DeserializeObject<RewardsMessage>(message);
+                    if (orderEvent == null)
+                    {
+                        throw new InvalidOperationException(
+                            "OrderCreated event could not be deserialized.");
+                    }
 
-        //        try
-        //        {
-        //            await _emailService.LogOrderPlaced(objMessage);
-        //            _channel.BasicAck(args.DeliveryTag, false);
-        //        }
-        //        catch
-        //        {
-        //           await _channel.BasicNack(args.DeliveryTag, false, true);
-        //        }
-        //    };
+                    if (orderEvent.OrderId <= 0 ||
+                        string.IsNullOrWhiteSpace(
+                            orderEvent.CustomerEmail))
+                    {
+                        throw new InvalidOperationException(
+                            "OrderCreated event has an invalid order ID or customer email.");
+                    }
 
-        //    await _channel.BasicConsume(
-        //        queue: _orderCreatedQueue,
-        //        autoAck: false,
-        //        consumer: consumer);
-        //}
+                    Console.WriteLine(
+                        $"[EmailAPI] Received OrderCreated event. " +
+                        $"EventId: {orderEvent.EventId}, " +
+                        $"OrderId: {orderEvent.OrderId}");
+
+                    await _emailService.OrderCreatedAndLog(orderEvent);
+
+                    await channel.BasicAckAsync(
+                        args.DeliveryTag, false);
+
+                    Console.WriteLine(
+                        $"[EmailAPI] OrderCreated event processed and acknowledged. " +
+                        $"OrderId: {orderEvent.OrderId}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(
+                        $"[EmailAPI] OrderCreated processing failed: {ex}");
+
+                    await channel.BasicNackAsync(
+                        args.DeliveryTag, false, true);
+                }
+            };
+
+            var tag = await channel.BasicConsumeAsync(
+                queue: _orderCreatedEmailQueue,
+                autoAck: false,
+                consumer: consumer);
+
+            Console.WriteLine(
+                $"[EmailAPI] Listening for OrderCreated messages on '{_orderCreatedEmailQueue}'.");
+
+            return tag;
+        }
+
+        public async Task StopAsync(CancellationToken cancellationToken)
+        {
+            // Stop each consumer before disposing its channel.
+            await CancelConsumerAsync(
+                _cartChannel, _cartConsumerTag);
+
+            await CancelConsumerAsync(
+                _registrationChannel, _registrationConsumerTag);
+
+            await CancelConsumerAsync(
+                _orderCreatedChannel, _orderCreatedConsumerTag);
+
+            await DisposeRabbitMQResourcesAsync();
+
+            Console.WriteLine(
+                "[EmailAPI] RabbitMQ consumers stopped.");
+        }
+
+        private static async Task CancelConsumerAsync(
+            IChannel? channel, string? consumerTag)
+        {
+            if (channel?.IsOpen == true &&
+                !string.IsNullOrWhiteSpace(consumerTag))
+            {
+                await channel.BasicCancelAsync(consumerTag);
+            }
+        }
+
+        private async Task DisposeRabbitMQResourcesAsync()
+        {
+            if (_cartChannel != null)
+            {
+                await _cartChannel.DisposeAsync();
+                _cartChannel = null;
+            }
+
+            if (_registrationChannel != null)
+            {
+                await _registrationChannel.DisposeAsync();
+                _registrationChannel = null;
+            }
+
+            if (_orderCreatedChannel != null)
+            {
+                await _orderCreatedChannel.DisposeAsync();
+                _orderCreatedChannel = null;
+            }
+
+            if (_connection != null)
+            {
+                await _connection.DisposeAsync();
+                _connection = null;
+            }
+        }
     }
 }

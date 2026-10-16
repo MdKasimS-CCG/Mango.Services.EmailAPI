@@ -33,7 +33,15 @@ namespace Mango.Services.EmailAPI.Services
             }
             message.Append("</ul>");
 
-            await LogAndEmail(message.ToString(), cartDto.CartHeader.Email);
+            bool success = await LogAndEmail(
+                message.ToString(),
+                cartDto.CartHeader.Email);
+
+            if (!success)
+            {
+                throw new InvalidOperationException(
+                    "Failed to save email cart details log.");
+            }
         }
 
         public async Task RegisterUserEmailAndLog(UserDto userDto)
@@ -49,7 +57,54 @@ namespace Mango.Services.EmailAPI.Services
             message.Append("<li>" + userDto.PhoneNumber);
             message.Append("</ul>");
 
-            await LogAndEmail(message.ToString(), userDto.Email);
+            bool success = await LogAndEmail(
+                message.ToString(),
+                userDto.Email);
+
+            if (!success)
+            {
+                throw new InvalidOperationException(
+                    "Failed to save registration email log.");
+            }
+        }
+
+        public async Task OrderCreatedAndLog(OrderCreatedEventDto orderEvent)
+        {
+            StringBuilder message = new StringBuilder();
+
+            message.AppendLine("<br/>Order Confirmation Requested");
+            message.AppendLine("<br/>Order ID: " + orderEvent.OrderId);
+            message.AppendLine("<br/>User ID: " + orderEvent.UserId);
+            message.AppendLine("<br/>Total: " + orderEvent.TotalAmount
+                + " " + orderEvent.Currency);
+            message.AppendLine("<br/>Order Date (UTC): "
+                + orderEvent.OccurredAtUtc);
+
+            message.AppendLine("<br/><ul>");
+
+            foreach (var item in orderEvent.Items)
+            {
+                message.Append("<li>");
+                message.Append(item.ProductName);
+                message.Append(" x ");
+                message.Append(item.Quantity);
+                message.Append(" @ ");
+                message.Append(item.UnitPrice);
+                message.Append(" " + orderEvent.Currency);
+                message.Append("</li>");
+            }
+
+            message.AppendLine("</ul>");
+
+            bool success = await LogAndEmail(
+                message.ToString(),
+                orderEvent.CustomerEmail);
+
+            if (!success)
+            {
+                throw new InvalidOperationException(
+                    "Failed to save order created email log.");
+            }
         }
 
         private async Task<bool> LogAndEmail(string message, string email)
@@ -70,9 +125,10 @@ namespace Mango.Services.EmailAPI.Services
             }
             catch (Exception ex)
             {
+                Console.WriteLine(
+                $"[EmailAPI] Failed to save email log: {ex}");
                 return false;
             }
         }
-
     }
 }
