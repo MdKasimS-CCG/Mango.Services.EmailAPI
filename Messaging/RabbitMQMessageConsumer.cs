@@ -5,12 +5,28 @@ using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using RabbitMQ.Client.Exceptions;
+using System.Data.Common;
 using System.Text;
 
 namespace Mango.Services.EmailAPI.Messaging
 {
-    public sealed class RabbitMQMessageConsumer : IHostedService
+    /// Runs as a BackgroundService so a broker that is not up yet does not
+    /// crash the host (REST endpoints keep serving while we retry).
+    /// Failure handling follows RewardAPI's OrderCreatedConsumer:
+    /// permanent failures are dead-lettered, transient ones get a bounded retry.
+    public sealed class RabbitMQMessageConsumer : BackgroundService
     {
+        // Same layout as RewardAPI (reward.dlx -> rewardordercreated.dlq):
+        // email.dlx routes "<queue>" to "<queue>.dlq" for each email queue.
+        // Producers (Mango.MessageBus) must declare the main queues with the
+        // same x-dead-letter-* arguments, or RabbitMQ rejects the declare (406).
+        private const string DeadLetterExchange = "email.dlx";
+
+        private const int MaxTransientAttempts = 3;
+        private static readonly TimeSpan ConnectRetryDelay = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan QueueMismatchRetryDelay = TimeSpan.FromSeconds(30);
+
         private readonly string _connectionString;
         private readonly string _emailCartQueue;
         private readonly string _registerUserQueue;
@@ -18,107 +34,195 @@ namespace Mango.Services.EmailAPI.Messaging
         private readonly EmailService _emailService;
 
         private IConnection? _connection;
-        private IChannel? _cartChannel;
-        private IChannel? _registrationChannel;
-        private IChannel? _orderCreatedChannel;
-
-        private string? _cartConsumerTag;
-        private string? _registrationConsumerTag;
-        private string? _orderCreatedConsumerTag;
+        private readonly List<(IChannel Channel, string ConsumerTag)> _consumers = new();
 
         public RabbitMQMessageConsumer(
-            IOptions<MessageQueueSettings> options,
-            IConfiguration configuration,
+            IOptions<EmailConsumerSettings> options,
             EmailService emailService)
         {
             ArgumentNullException.ThrowIfNull(options);
-            ArgumentNullException.ThrowIfNull(configuration);
             ArgumentNullException.ThrowIfNull(emailService);
+            var settings = options.Value;
+
+            _connectionString = settings.ConnectionString;
+            _emailCartQueue = settings.EmailShoppingCartQueue;
+            _registerUserQueue = settings.RegisterUserQueue;
+            _orderCreatedEmailQueue = settings.OrderCreatedEmailQueue;
 
             _emailService = emailService;
-
-            _connectionString =
-                options.Value.RabbitMQ?.ConnectionString
-                ?? throw new InvalidOperationException(
-                    "RabbitMQ connection string is missing.");
-
-            _emailCartQueue = GetQueueName(
-                configuration, "EmailShoppingCartQueue");
-
-            _registerUserQueue = GetQueueName(
-                configuration, "RegisterUserQueue");
-
-            _orderCreatedEmailQueue = GetQueueName(
-                configuration, "OrderCreatedEmailQueue");
         }
 
-        private static string GetQueueName(
-            IConfiguration configuration, string key)
-        {
-            return configuration[$"TopicAndQueueNames:{key}"]
-                ?? throw new InvalidOperationException(
-                    $"Queue configuration '{key}' is missing.");
-        }
-
-        public async Task StartAsync(CancellationToken cancellationToken)
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             var factory = new ConnectionFactory
             {
-                Uri = new Uri(_connectionString)
+                Uri = new Uri(_connectionString),
+                // Reconnects (and re-registers consumers) after a drop post-startup.
+                AutomaticRecoveryEnabled = true
             };
+
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await StartConsumersAsync(factory, stoppingToken);
+                    break;
+                }
+                catch (BrokerUnreachableException ex)
+                    when (!stoppingToken.IsCancellationRequested)
+                {
+                    Console.WriteLine(
+                        $"[EmailAPI] Could not connect to RabbitMQ. Retrying in " +
+                        $"{ConnectRetryDelay.TotalSeconds} seconds. {ex.Message}");
+
+                    await DisposeRabbitMQResourcesAsync();
+                    await Task.Delay(ConnectRetryDelay, stoppingToken);
+                }
+                catch (OperationInterruptedException ex)
+                    when (ex.ShutdownReason?.ReplyCode == 406 &&
+                          !stoppingToken.IsCancellationRequested)
+                {
+                    // PRECONDITION_FAILED: the queue already exists with different
+                    // arguments, e.g. a producer declared it without dead-lettering.
+                    // Retrying lets us recover once the queue is recreated.
+                    Console.WriteLine(
+                        $"[EmailAPI] A queue exists with arguments that do not match " +
+                        $"the dead-letter setup: {ex.ShutdownReason?.ReplyText}. " +
+                        $"Retrying in {QueueMismatchRetryDelay.TotalSeconds} seconds.");
+
+                    await DisposeRabbitMQResourcesAsync();
+                    await Task.Delay(QueueMismatchRetryDelay, stoppingToken);
+                }
+            }
 
             try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                _connection = await factory.CreateConnectionAsync();
-
-                // Each consumer owns its own channel.
-                _cartChannel = await CreateConsumerChannelAsync(
-                    _emailCartQueue);
-
-                _registrationChannel = await CreateConsumerChannelAsync(
-                    _registerUserQueue);
-
-                _orderCreatedChannel = await CreateConsumerChannelAsync(
-                    _orderCreatedEmailQueue);
-
-                _cartConsumerTag = await StartCartConsumerAsync(
-                    _cartChannel);
-
-                _registrationConsumerTag =
-                    await StartRegistrationConsumerAsync(
-                        _registrationChannel);
-
-                _orderCreatedConsumerTag =
-                    await StartOrderCreatedConsumerAsync(
-                        _orderCreatedChannel);
+                await Task.Delay(Timeout.Infinite, stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                // The host is stopping; the finally block closes broker resources.
+            }
+            finally
+            {
+                await StopConsumersAsync();
+                await DisposeRabbitMQResourcesAsync();
 
                 Console.WriteLine(
-                    "[EmailAPI] All RabbitMQ consumers started.");
-            }
-            catch
-            {
-                await DisposeRabbitMQResourcesAsync();
-                throw;
+                    "[EmailAPI] RabbitMQ consumers stopped.");
             }
         }
 
-        private async Task<IChannel> CreateConsumerChannelAsync(
-            string queueName)
+        private async Task StartConsumersAsync(
+            ConnectionFactory factory, CancellationToken stoppingToken)
         {
-            var channel = await _connection!.CreateChannelAsync();
+            _connection = await factory.CreateConnectionAsync(stoppingToken);
+
+            // Each consumer owns its own channel.
+            await StartConsumerAsync<CartDto>(
+                _emailCartQueue,
+                "Cart-email",
+                validate: null,
+                handle: cart => _emailService.EmailCartAndLog(cart),
+                stoppingToken);
+
+            await StartConsumerAsync<UserDto>(
+                _registerUserQueue,
+                "Registration",
+                validate: null,
+                handle: user => _emailService.RegisterUserEmailAndLog(user),
+                stoppingToken);
+
+            await StartConsumerAsync<OrderCreatedEventDto>(
+                _orderCreatedEmailQueue,
+                "OrderCreated",
+                validate: orderEvent =>
+                {
+                    if (orderEvent.OrderId <= 0 ||
+                        string.IsNullOrWhiteSpace(orderEvent.CustomerEmail))
+                    {
+                        throw new InvalidDataException(
+                            "OrderCreated event has an invalid order ID or customer email.");
+                    }
+                },
+                handle: orderEvent => _emailService.OrderCreatedAndLog(orderEvent),
+                stoppingToken);
+
+            Console.WriteLine(
+                "[EmailAPI] All RabbitMQ consumers started.");
+        }
+
+        private async Task StartConsumerAsync<T>(
+            string queueName,
+            string label,
+            Action<T>? validate,
+            Func<T, Task> handle,
+            CancellationToken stoppingToken)
+        {
+            var channel = await _connection!.CreateChannelAsync(
+                cancellationToken: stoppingToken);
 
             try
             {
-                await channel.QueueDeclareAsync(
-                    queue: queueName,
-                    durable: false,
-                    exclusive: false,
-                    autoDelete: false,
-                    arguments: null);
+                await DeclareQueueWithDeadLetterAsync(
+                    channel, queueName, stoppingToken);
 
-                return channel;
+                var consumer = new AsyncEventingBasicConsumer(channel);
+
+                consumer.ReceivedAsync += async (_, args) =>
+                {
+                    try
+                    {
+                        var message = Encoding.UTF8.GetString(args.Body.Span);
+
+                        var payload = JsonConvert.DeserializeObject<T>(message)
+                            ?? throw new InvalidDataException(
+                                $"{label} message was empty.");
+
+                        validate?.Invoke(payload);
+
+                        await HandleWithRetryAsync(
+                            () => handle(payload), label, stoppingToken);
+
+                        await channel.BasicAckAsync(
+                            args.DeliveryTag, multiple: false);
+
+                        Console.WriteLine(
+                            $"[EmailAPI] {label} message processed and acknowledged.");
+                    }
+                    catch (OperationCanceledException)
+                        when (stoppingToken.IsCancellationRequested)
+                    {
+                        // Shutting down mid-retry: leave the message unacked so
+                        // RabbitMQ redelivers it when the channel closes.
+                    }
+                    catch (Exception ex)
+                    {
+                        // Permanent failure (bad JSON, failed validation) or a
+                        // transient one that ran out of retries. Never requeue:
+                        // RabbitMQ moves it to "<queue>.dlq" via email.dlx.
+                        Console.WriteLine(
+                            $"[EmailAPI] {label} processing failed; " +
+                            $"dead-lettering to '{queueName}.dlq'. {ex}");
+
+                        if (channel.IsOpen)
+                        {
+                            await channel.BasicNackAsync(
+                                args.DeliveryTag, multiple: false, requeue: false);
+                        }
+                    }
+                };
+
+                var tag = await channel.BasicConsumeAsync(
+                    queue: queueName,
+                    autoAck: false,
+                    consumer: consumer,
+                    cancellationToken: stoppingToken);
+
+                _consumers.Add((channel, tag));
+
+                Console.WriteLine(
+                    $"[EmailAPI] Listening for {label} messages on '{queueName}'.");
             }
             catch
             {
@@ -127,218 +231,110 @@ namespace Mango.Services.EmailAPI.Messaging
             }
         }
 
-        private async Task<string> StartCartConsumerAsync(
-            IChannel channel)
+        private static async Task DeclareQueueWithDeadLetterAsync(
+            IChannel channel, string queueName, CancellationToken stoppingToken)
         {
-            var consumer = new AsyncEventingBasicConsumer(channel);
+            var deadLetterQueue = $"{queueName}.dlq";
 
-            consumer.ReceivedAsync += async (_, args) =>
+            await channel.ExchangeDeclareAsync(
+                exchange: DeadLetterExchange,
+                type: ExchangeType.Direct,
+                durable: true,
+                autoDelete: false,
+                arguments: null,
+                cancellationToken: stoppingToken);
+
+            await channel.QueueDeclareAsync(
+                queue: deadLetterQueue,
+                durable: true,
+                exclusive: false,
+                autoDelete: false,
+                arguments: null,
+                cancellationToken: stoppingToken);
+
+            await channel.QueueBindAsync(
+                queue: deadLetterQueue,
+                exchange: DeadLetterExchange,
+                routingKey: queueName,
+                cancellationToken: stoppingToken);
+
+            var queueArguments = new Dictionary<string, object?>
+            {
+                ["x-dead-letter-exchange"] = DeadLetterExchange,
+                ["x-dead-letter-routing-key"] = queueName
+            };
+
+            await channel.QueueDeclareAsync(
+                queue: queueName,
+                durable: true,
+                exclusive: false,
+                autoDelete: false,
+                arguments: queueArguments,
+                cancellationToken: stoppingToken);
+        }
+
+        // Bounded retry for transient failures (1s, 2s back-off). Anything
+        // else, or a transient failure on the last attempt, propagates and
+        // the caller dead-letters the message.
+        private static async Task HandleWithRetryAsync(
+            Func<Task> action, string label, CancellationToken stoppingToken)
+        {
+            for (var attempt = 1; ; attempt++)
             {
                 try
                 {
-                    var message = Encoding.UTF8.GetString(
-                        args.Body.ToArray());
-
-                    var cart = JsonConvert.DeserializeObject<CartDto>(
-                        message);
-
-                    if (cart == null)
-                    {
-                        throw new InvalidOperationException(
-                            "Cart message could not be deserialized.");
-                    }
-
-                    await _emailService.EmailCartAndLog(cart);
-
-                    await channel.BasicAckAsync(
-                        args.DeliveryTag, false);
-
-                    Console.WriteLine(
-                        "[EmailAPI] Cart-email message processed and acknowledged.");
+                    await action();
+                    return;
                 }
                 catch (Exception ex)
+                    when (attempt < MaxTransientAttempts && IsTransientFailure(ex))
                 {
+                    var delay = TimeSpan.FromSeconds(Math.Pow(2, attempt - 1));
+
                     Console.WriteLine(
-                        $"[EmailAPI] Cart-email processing failed: {ex}");
+                        $"[EmailAPI] {label} attempt {attempt}/{MaxTransientAttempts} " +
+                        $"failed with a transient error; retrying in " +
+                        $"{delay.TotalSeconds} seconds. {ex.Message}");
 
-                    await channel.BasicNackAsync(
-                        args.DeliveryTag, false, true);
+                    await Task.Delay(delay, stoppingToken);
                 }
-            };
-
-            var tag = await channel.BasicConsumeAsync(
-                queue: _emailCartQueue,
-                autoAck: false,
-                consumer: consumer);
-
-            Console.WriteLine(
-                $"[EmailAPI] Listening for cart-email messages on '{_emailCartQueue}'.");
-
-            return tag;
+            }
         }
 
-        private async Task<string> StartRegistrationConsumerAsync(
-            IChannel channel)
+        // Any database error counts as transient: SqlClient does not reliably
+        // set DbException.IsTransient, and the retry is bounded, so a
+        // misclassified permanent DB error only costs two extra attempts.
+        private static bool IsTransientFailure(Exception exception)
         {
-            var consumer = new AsyncEventingBasicConsumer(channel);
-
-            consumer.ReceivedAsync += async (_, args) =>
+            for (var current = exception; current is not null; current = current.InnerException)
             {
-                try
-                {
-                    var message = Encoding.UTF8.GetString(
-                        args.Body.ToArray());
+                if (current is TimeoutException || current is DbException)
+                    return true;
+            }
 
-                    var user = JsonConvert.DeserializeObject<UserDto>(
-                        message);
-
-                    if (user == null)
-                    {
-                        throw new InvalidOperationException(
-                            "Registration message could not be deserialized.");
-                    }
-
-                    await _emailService.RegisterUserEmailAndLog(user);
-
-                    await channel.BasicAckAsync(
-                        args.DeliveryTag, false);
-
-                    Console.WriteLine(
-                        "[EmailAPI] Registration message processed and acknowledged.");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine(
-                        $"[EmailAPI] Registration processing failed: {ex}");
-
-                    await channel.BasicNackAsync(
-                        args.DeliveryTag, false, true);
-                }
-            };
-
-            var tag = await channel.BasicConsumeAsync(
-                queue: _registerUserQueue,
-                autoAck: false,
-                consumer: consumer);
-
-            Console.WriteLine(
-                $"[EmailAPI] Listening for registration messages on '{_registerUserQueue}'.");
-
-            return tag;
+            return false;
         }
 
-        private async Task<string> StartOrderCreatedConsumerAsync(
-            IChannel channel)
-        {
-            var consumer = new AsyncEventingBasicConsumer(channel);
-
-            consumer.ReceivedAsync += async (_, args) =>
-            {
-                try
-                {
-                    var message = Encoding.UTF8.GetString(
-                        args.Body.ToArray());
-
-                    var orderEvent =
-                        JsonConvert.DeserializeObject<OrderCreatedEventDto>(
-                            message);
-
-                    if (orderEvent == null)
-                    {
-                        throw new InvalidOperationException(
-                            "OrderCreated event could not be deserialized.");
-                    }
-
-                    if (orderEvent.OrderId <= 0 ||
-                        string.IsNullOrWhiteSpace(
-                            orderEvent.CustomerEmail))
-                    {
-                        throw new InvalidOperationException(
-                            "OrderCreated event has an invalid order ID or customer email.");
-                    }
-
-                    Console.WriteLine(
-                        $"[EmailAPI] Received OrderCreated event. " +
-                        $"EventId: {orderEvent.EventId}, " +
-                        $"OrderId: {orderEvent.OrderId}");
-
-                    await _emailService.OrderCreatedAndLog(orderEvent);
-
-                    await channel.BasicAckAsync(
-                        args.DeliveryTag, false);
-
-                    Console.WriteLine(
-                        $"[EmailAPI] OrderCreated event processed and acknowledged. " +
-                        $"OrderId: {orderEvent.OrderId}");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine(
-                        $"[EmailAPI] OrderCreated processing failed: {ex}");
-
-                    await channel.BasicNackAsync(
-                        args.DeliveryTag, false, true);
-                }
-            };
-
-            var tag = await channel.BasicConsumeAsync(
-                queue: _orderCreatedEmailQueue,
-                autoAck: false,
-                consumer: consumer);
-
-            Console.WriteLine(
-                $"[EmailAPI] Listening for OrderCreated messages on '{_orderCreatedEmailQueue}'.");
-
-            return tag;
-        }
-
-        public async Task StopAsync(CancellationToken cancellationToken)
+        private async Task StopConsumersAsync()
         {
             // Stop each consumer before disposing its channel.
-            await CancelConsumerAsync(
-                _cartChannel, _cartConsumerTag);
-
-            await CancelConsumerAsync(
-                _registrationChannel, _registrationConsumerTag);
-
-            await CancelConsumerAsync(
-                _orderCreatedChannel, _orderCreatedConsumerTag);
-
-            await DisposeRabbitMQResourcesAsync();
-
-            Console.WriteLine(
-                "[EmailAPI] RabbitMQ consumers stopped.");
-        }
-
-        private static async Task CancelConsumerAsync(
-            IChannel? channel, string? consumerTag)
-        {
-            if (channel?.IsOpen == true &&
-                !string.IsNullOrWhiteSpace(consumerTag))
+            foreach (var (channel, consumerTag) in _consumers)
             {
-                await channel.BasicCancelAsync(consumerTag);
+                if (channel.IsOpen)
+                {
+                    await channel.BasicCancelAsync(consumerTag);
+                }
             }
         }
 
         private async Task DisposeRabbitMQResourcesAsync()
         {
-            if (_cartChannel != null)
+            foreach (var (channel, _) in _consumers)
             {
-                await _cartChannel.DisposeAsync();
-                _cartChannel = null;
+                await channel.DisposeAsync();
             }
 
-            if (_registrationChannel != null)
-            {
-                await _registrationChannel.DisposeAsync();
-                _registrationChannel = null;
-            }
-
-            if (_orderCreatedChannel != null)
-            {
-                await _orderCreatedChannel.DisposeAsync();
-                _orderCreatedChannel = null;
-            }
+            _consumers.Clear();
 
             if (_connection != null)
             {

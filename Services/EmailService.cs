@@ -33,15 +33,9 @@ namespace Mango.Services.EmailAPI.Services
             }
             message.Append("</ul>");
 
-            bool success = await LogAndEmail(
+            await LogAndEmail(
                 message.ToString(),
                 cartDto.CartHeader.Email);
-
-            if (!success)
-            {
-                throw new InvalidOperationException(
-                    "Failed to save email cart details log.");
-            }
         }
 
         public async Task RegisterUserEmailAndLog(UserDto userDto)
@@ -57,15 +51,9 @@ namespace Mango.Services.EmailAPI.Services
             message.Append("<li>" + userDto.PhoneNumber);
             message.Append("</ul>");
 
-            bool success = await LogAndEmail(
+            await LogAndEmail(
                 message.ToString(),
                 userDto.Email);
-
-            if (!success)
-            {
-                throw new InvalidOperationException(
-                    "Failed to save registration email log.");
-            }
         }
 
         public async Task OrderCreatedAndLog(OrderCreatedEventDto orderEvent)
@@ -96,18 +84,12 @@ namespace Mango.Services.EmailAPI.Services
 
             message.AppendLine("</ul>");
 
-            bool success = await LogAndEmail(
+            await LogAndEmail(
                 message.ToString(),
                 orderEvent.CustomerEmail);
-
-            if (!success)
-            {
-                throw new InvalidOperationException(
-                    "Failed to save order created email log.");
-            }
         }
 
-        private async Task<bool> LogAndEmail(string message, string email)
+        private async Task LogAndEmail(string message, string email)
         {
             try
             {
@@ -121,13 +103,15 @@ namespace Mango.Services.EmailAPI.Services
                 await using var _db = new AppDbContext(_dbOptions);
                 await _db.EmailLoggers.AddAsync(emailLogger);
                 await _db.SaveChangesAsync();
-                return true;
             }
             catch (Exception ex)
             {
                 Console.WriteLine(
                 $"[EmailAPI] Failed to save email log: {ex}");
-                return false;
+
+                // Rethrow the original exception so the consumer can tell a
+                // transient DB failure (retry) from a permanent one (dead-letter).
+                throw;
             }
         }
     }

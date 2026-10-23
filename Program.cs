@@ -119,8 +119,52 @@ var mqSettings = builder.Configuration
     .GetSection("MessageQueue")
     .Get<MessageQueueSettings>();
 
-if (mqSettings.Provider == "RabbitMQ")
+if (string.Equals(
+    mqSettings?.Provider,
+    "RabbitMQ",
+    StringComparison.OrdinalIgnoreCase))
 {
+    builder.Services
+        .AddOptions<EmailConsumerSettings>()
+        .Configure<IConfiguration>((settings, configuration) =>
+        {
+            settings.ConnectionString =
+                configuration["MessageQueue:RabbitMQ:ConnectionString"]
+                ?? string.Empty;
+
+            settings.EmailShoppingCartQueue =
+                configuration["TopicAndQueueNames:EmailShoppingCartQueue"]
+                ?? string.Empty;
+
+            settings.RegisterUserQueue =
+                configuration["TopicAndQueueNames:RegisterUserQueue"]
+                ?? string.Empty;
+
+            settings.OrderCreatedEmailQueue =
+                configuration["TopicAndQueueNames:OrderCreatedEmailQueue"]
+                ?? string.Empty;
+        })
+        .Validate(
+            settings =>
+                Uri.TryCreate(
+                    settings.ConnectionString,
+                    UriKind.Absolute,
+                    out var uri)
+                && (uri.Scheme == "amqp" || uri.Scheme == "amqps"),
+            "A valid RabbitMQ AMQP connection string is required.")
+        .Validate(
+            settings =>
+                !string.IsNullOrWhiteSpace(settings.EmailShoppingCartQueue),
+            "TopicAndQueueNames:EmailShoppingCartQueue is required.")
+        .Validate(
+            settings =>
+                !string.IsNullOrWhiteSpace(settings.RegisterUserQueue),
+            "TopicAndQueueNames:RegisterUserQueue is required.")
+        .Validate(
+            settings =>
+                !string.IsNullOrWhiteSpace(settings.OrderCreatedEmailQueue),
+            "TopicAndQueueNames:OrderCreatedEmailQueue is required.")
+        .ValidateOnStart();
     builder.Services.AddHostedService<RabbitMQMessageConsumer>();
 }
 /// Note: Will be used when ServiceBusConsumer will be created
