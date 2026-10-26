@@ -33,7 +33,9 @@ namespace Mango.Services.EmailAPI.Services
             }
             message.Append("</ul>");
 
-            await LogAndEmail(message.ToString(), cartDto.CartHeader.Email);
+            await LogAndEmail(
+                message.ToString(),
+                cartDto.CartHeader.Email);
         }
 
         public async Task RegisterUserEmailAndLog(UserDto userDto)
@@ -49,10 +51,45 @@ namespace Mango.Services.EmailAPI.Services
             message.Append("<li>" + userDto.PhoneNumber);
             message.Append("</ul>");
 
-            await LogAndEmail(message.ToString(), userDto.Email);
+            await LogAndEmail(
+                message.ToString(),
+                userDto.Email);
         }
 
-        private async Task<bool> LogAndEmail(string message, string email)
+        public async Task OrderCreatedAndLog(OrderCreatedEventDto orderEvent)
+        {
+            StringBuilder message = new StringBuilder();
+
+            message.AppendLine("<br/>Order Confirmation Requested");
+            message.AppendLine("<br/>Order ID: " + orderEvent.OrderId);
+            message.AppendLine("<br/>User ID: " + orderEvent.UserId);
+            message.AppendLine("<br/>Total: " + orderEvent.TotalAmount
+                + " " + orderEvent.Currency);
+            message.AppendLine("<br/>Order Date (UTC): "
+                + orderEvent.OccurredAtUtc);
+
+            message.AppendLine("<br/><ul>");
+
+            foreach (var item in orderEvent.Items)
+            {
+                message.Append("<li>");
+                message.Append(item.ProductName);
+                message.Append(" x ");
+                message.Append(item.Quantity);
+                message.Append(" @ ");
+                message.Append(item.UnitPrice);
+                message.Append(" " + orderEvent.Currency);
+                message.Append("</li>");
+            }
+
+            message.AppendLine("</ul>");
+
+            await LogAndEmail(
+                message.ToString(),
+                orderEvent.CustomerEmail);
+        }
+
+        private async Task LogAndEmail(string message, string email)
         {
             try
             {
@@ -66,13 +103,16 @@ namespace Mango.Services.EmailAPI.Services
                 await using var _db = new AppDbContext(_dbOptions);
                 await _db.EmailLoggers.AddAsync(emailLogger);
                 await _db.SaveChangesAsync();
-                return true;
             }
             catch (Exception ex)
             {
-                return false;
+                Console.WriteLine(
+                $"[EmailAPI] Failed to save email log: {ex}");
+
+                // Rethrow the original exception so the consumer can tell a
+                // transient DB failure (retry) from a permanent one (dead-letter).
+                throw;
             }
         }
-
     }
 }
